@@ -1,0 +1,581 @@
+#!/usr/bin/perl
+#
+# myoracle
+$version = '0.63';
+
+use DBI;
+use Term::ReadLine;
+use Fcntl;
+use FileHandle;
+
+# We catch sigs to clean a bit before ending
+$SIG{INT}  = \&abortProgram;
+$SIG{HUP}  = \&abortProgram;
+$SIG{TERM} = \&abortProgram;
+
+# max number of lines to store in history file
+my $HISTORY_MAX = 500;
+
+# you only get a history file if there's somewhere to put it
+my $HISTORY_FILE = "";
+$HISTORY_FILE = "$ENV{HOME}/.myoracle_history" if defined $ENV{HOME};
+
+
+# parse command-line arguments
+for ($i = 0; $i <= $#ARGV; $i++)
+{
+        $curarg = $ARGV[$i];
+
+        if ($curarg eq '-e')
+        {
+                $command = $ARGV[$i+1];
+                if (!$command || (substr($command, 0, 1) eq '-'))
+                {
+                        $fatal = '-e requires a statement to execute';
+                        $i = $#ARGV;
+                }
+                $i++;
+                chomp $command;
+                $command .= ';' unless ($command =~ /;$/);
+        }
+
+        elsif ($curarg eq '-f')
+        {
+                $file = $ARGV[$i+1];
+                if (!$file || (substr($file, 0, 1) eq '-'))
+                {
+                        $fatal = '-f requires a file to execute';
+                        $i = $#ARGV;
+                }
+                $i++;
+                chomp $file;
+        }
+
+        elsif ($curarg eq '-F')
+        {
+                $optFancy = 1;
+        }
+
+        elsif ($curarg =~ /(.*)\/(.*)@(.*)/)
+        {
+                $ociUser = $1;
+                $ociPw = $2;
+                $ociTns = $3;
+        }
+
+        elsif ($curarg =~ /(.*)\/(.*)/)
+        {
+                $ociUser = $1;
+                $ociPw = $2;
+        }
+
+        elsif ($curarg =~ /(.*)@(.*)/)
+        {
+                $ociUser = $1;
+                $ociTns = $2;
+        }
+
+        elsif ($curarg =~ /^@(.*)/)
+        {
+                $ociTns = $1;
+        }
+
+        elsif (($curarg eq '-h') || ($curarg eq '-?') || ($curarg eq '--help'))
+        {
+                $fatal = <<EOF;
+myoracle $version <http://software.u.nu/myoracle/>
+
+Usage:
+   myoracle [options] [login-info]
+
+Options:
+   -e statement    Execute SQL statement and exit
+   -f file         Execute SQL statement in file and exit
+   -F              Draw fancy tables (with -e or -f)
+   -?, -h, --help  Show this help text
+
+Login-info:
+   [user/password\@tns|user\@tns|user/password]
+EOF
+                $i = $#ARGV;
+        }
+}
+
+# die if we got an error processing the command-line args
+if ($fatal)
+{
+        print "$fatal\n";
+        exit;
+}
+
+$ociTns = $ENV{ORACLE_SID} if defined $ENV{ORACLE_SID} && ! $ociTns;
+
+$tries = 0;
+while ($tries < 3)
+{
+        if (!$ociUser)
+        {
+                print STDERR "Username: ";
+                chomp ($ociUser = <STDIN>);
+                print STDERR "Password: ";
+                system "stty -echo";
+                chomp ($ociPw = <STDIN>);
+                system "stty echo"; print "\n";
+                if (!$ociTns)
+                {
+                        print STDERR "TNS: ";
+                        $ociTns = <STDIN>; chomp $ociTns;
+                }
+        }
+
+        elsif(!$ociPw)
+        {
+                print STDERR "Password: ";
+                system "stty -echo";
+                chomp ($ociPw = <STDIN>);
+                system "stty echo"; print "\n";
+        }
+
+        exit if !$ociUser;
+         $dbh = DBI->connect("dbi:Oracle:$ociTns", $ociUser, $ociPw, { RaiseError => 1, AutoCommit => 0 });
+        last if $dbh;
+        print $DBI::errstr . "\n";
+        undef $ociUser, $ociPw;
+        $tries++;
+}
+
+if (!$dbh)
+{
+        print "Unable to login to Oracle server.\n";
+        exit;
+}
+
+# if we got a filename, try to read a SQL statement from there
+if ($file)
+{
+        $command = &parseFile($file);
+        chomp $command;
+}
+
+# if a statement was supplied on the command line, process it and exit
+if ($command)
+{
+        &doSQL($command, $optFancy);
+        abortProgram();
+}
+
+## INTERACTIVE SESSION
+# set up readline & completion
+$term = new Term::ReadLine 'myoracle';
+$attribs = $term->Attribs;
+$attribs->{attempted_completion_function} = \&myComplete;
+$attribs->{completion_word} = [qw(show select update insert delete describe quit exit edit from where order group)];
+$term->ReadHistory($HISTORY_FILE) if -f $HISTORY_FILE;
+# set up external editor
+my $tmp_dir = defined $ENV{HOME} ? "$ENV{HOME}" : "/tmp/";
+my $editor  = defined $ENV{EDITOR} ? $ENV{EDITOR} : "vi";
+my ($temp_file, $fh) = ("");
+# add the user's tables to the completion list
+&tables_completion();
+
+# main loop
+print "Connected to database.\n";
+$buf = '';
+MAIN: while ( defined ($_ = $term->readline((($buf) ? ((" " x (length($ociTns) + length($ociUser))) . '-> ') : "$ociTns:$ociUser> "))) )
+{
+        chomp;
+        if (!length($buf)) { if ((/^quit/i) || (/^exit/i)) { &abortProgram; } }
+
+        # add the latest input to the end of the command buffer
+        if ($_) { $buf .= (($buf) ? ' ' : '') . $_; }
+
+        # keep getting more input until statement is terminated with a semicolon
+        # or we get a non-SQL command
+        next unless ($buf =~ /;\s*$/)
+                || ($buf =~ /^\?/)
+                || ($buf =~ /^set/i)
+                || ($buf =~ /^help/i)
+                || ($buf =~ /^edit/i)
+                || ($buf =~ /^describe/i)
+                || ($buf =~ /^show/i)
+                || ($buf =~ /^\@/);
+
+        &doSQL($buf, 1);
+        $buf = '';
+}
+abortProgram();
+
+#-------------------------------------------------------------------------------------------
+
+sub doSQL
+{       my ($buf, $fancyTables) = @_;
+
+        # if there's nothing there, don't bother continuing
+        return unless length $buf;
+
+        # strip leading and trailing whitespace, and semicolon
+        $buf =~ s/^\s*(.*)\s*;\s*$/$1/;
+
+        if ($buf =~ /^\?/ || $buf =~ /^help/i)
+        {
+                print <<EOF;
+myoracle $version <http://software.u.nu/myoracle/>
+
+show tables            list tables owned by current user
+describe <table>       show field names and descriptions for <table>
+edit                   invoke visual editor on most-recent SQL command
+set                    show possible options
+set <option>           show current state of <option>
+set <option> <value>   set <option> to <value>
+EOF
+                return;
+        }
+
+        elsif ($buf =~ /^edit/i)
+        {
+                # preload a temp file with the most recent SQL statement
+                ($fh, $temp_file) = make_temp_file() unless $temp_file;
+                $fh->truncate(0); seek $fh, 0, 0;
+                $fh->print (($setopts{'beautify'}) ? sqlbeautify($lastcmd) : $lastcmd);
+
+                # call the external editor
+                my @args = ($editor, $temp_file);
+                system (@args);
+
+                # read the modified buffer back in
+                seek $fh, 0, 0;
+                $buf = join "", <$fh>;
+                $buf = strip($buf);
+                return unless $buf;
+                $term->addhistory("$buf;");
+        }
+
+        my $desc = 0;
+        if (($buf =~ /^\s*describe\s+([\w\d]+)/i) || ($buf =~ /^\s*desc\s+([\w\d]+)/i))
+        {
+                my $table = uc($1);
+                $buf = "select a.column_name as col_name, decode (a.nullable, 'N', 'Not null', '') as nulls, a.data_type as col_type, decode (a.data_type, 'NUMBER', a.data_precision, 'DATE', '', a.data_length) as col_size, a.data_default as default_val from all_tab_columns a where upper(a.table_name) = '$table' order by a.column_id";
+                $desc = 1;
+        }
+
+        elsif ($buf =~ /^set(.*)/i)
+        {
+                $setopt = $1;
+                ($option, $value) = ($setopt =~ /\s*(\S+)\s*(\S*)/);
+                $option = lc $option;
+
+                if (grep /^$option$/, qw(linemode beautify))
+                {
+                        $value = lc $value;
+                        if (!$value)
+                        {
+                                print "$option is " . (($setopts{$option}) ? 'on' : 'off') . "\n";
+                                return;
+                        }
+
+                        if ($value eq 'on' || $value eq 'true' || $value eq 'yes') { $boolval = 1; }
+                        elsif ($value eq 'off' || $value eq 'false' || $value eq 'no') { $boolval = 0; }
+                        else
+                        {
+                                print "Usage: set $option on|off\n";
+                                return;
+                        }
+
+                        if ($boolval == 0) { $setopts{$option} = 0; }
+                        elsif ($boolval == 1) { $setopts{$option} = 1; }
+                }
+                else
+                {
+                        if (!$option)
+                        {
+                                print "set linemode on|OFF   toggle returning query results one column per line\nset beautify on|OFF   toggle automatic formatting of SQL in edit buffer\n";
+                        }
+                        else { print "Unknown option: $option\n"; }
+                }
+                return;
+        }
+
+        elsif ($buf =~ /^\s*show\s+tables/i)
+        {
+                $buf = "select table_name from user_Tables order by table_name ";
+        }
+
+        elsif ($buf =~ /^\@(.*)/)
+        {
+                $buf = &parseFile($1);
+                return if (!$buf);
+                $lastcmd = $buf;
+        }
+
+        # if it was a user-provided SQL statement, remember it for the edit buffer
+        else
+        {
+                $lastcmd = $buf;
+        }
+
+        eval { $sth = $dbh->prepare($buf); };
+        if ($@) { print $DBI::errstr . "\n"; return; }
+        eval { $numfields = $sth->{NUM_OF_FIELDS}; };
+        if ($@) { print $DBI::errstr . "\n"; return; }
+
+        @fieldname = @{ $sth->{NAME_lc} };
+        @maxlen = map { length $_ } @fieldname;
+
+        $maxfieldname = 0;
+        for (@maxlen)
+        {
+                $maxfieldname = $_ if $maxfieldname < $_ ;
+        }
+
+        eval { $numrowsaff = $sth->execute; };
+        if ($@ || $DBI::errstr) { print "While exec $buf: ",$DBI::errstr . "\n"; return; }
+
+        if ($buf =~ /^select/i)
+        {
+                $numrows = 0;
+                while ($row_ref = $sth->fetch)
+                {
+                        $numrows ++;
+                        $i = 0;
+                        push @allrows, [ @$row_ref ];
+                        foreach $col (@$row_ref)
+                        {
+                                if (length($col) > $maxlen[$i])
+                                {
+                                        $maxlen[$i] = length($col);
+                                }
+                                $i++;
+                        }
+                }
+
+                $sth->finish();
+
+                if ($numrows)
+                {
+                        if ($setopts{linemode})
+                        {
+                                $rowcount = 0;
+                                foreach $rowref (@allrows)
+                                {
+                                        print "\n" if $rowcount;
+                                        $rowcount++;
+                                        print "-- Record $rowcount:\n" if ($numrows > 1);
+                                        for (0 .. $#fieldname)
+                                        {
+                                                print "$fieldname[$_]" .
+                                                        " " x ($maxfieldname - length($fieldname[$_])) .
+                                                        " : $rowref->[$_]\n";
+                                        }
+                                }
+                        }
+
+                        else
+                        {
+                                if ($fancyTables)
+                                {
+                                        printBorderLine(@maxlen);
+                                        printFancyLine(\@fieldname, \@maxlen);
+                                        printBorderLine(@maxlen);
+                                } else { printPlainLine(@fieldname); }
+
+                                foreach $rowref (@allrows)
+                                {
+                                        if ($fancyTables) { printFancyLine($rowref, \@maxlen); } else { printPlainLine(@$rowref); }
+                                }
+
+                                if ($fancyTables)
+                                {
+                                        printBorderLine(@maxlen);
+                                        print "$numrows ", ($numrows == 1) ? 'row' : 'rows', " in set.\n";
+                                }
+                        }
+                }
+
+                elsif($numfields)
+                {
+                        print (($desc) ? "No such object.\n" : "No rows retrieved.\n");
+                }
+        }
+
+        else
+        {
+                print (($numrowsaff == '0E0') ? "Command processed.\n" : "$numrowsaff rows affected.\n");
+        }
+
+        print "\n";
+        undef @maxlen;
+        undef $sth;
+        undef @fieldname;
+        undef @allrows;
+}
+
+sub abortProgram()
+{
+        unless ($term) {$dbh->disconnect(); exit;}
+        # delete editor temp file
+        unlink_temp_file($fh, $temp_file) if $temp_file && -f $temp_file;
+
+        # write out the history file
+        $term->StifleHistory($HISTORY_MAX);
+        if ($HISTORY_FILE)
+        {
+                if (! $term->WriteHistory($HISTORY_FILE))
+                {
+                        print STDERR "Unable to save the history file $HISTORY_FILE.\n";
+                }
+        }
+
+        $dbh->disconnect();
+        print STDERR "Database connection closed.\n";
+        exit;
+}
+
+sub printBorderLine
+{
+        print "+-", join("-+-", map { "-" x $_ } @_), "-+\n";
+}
+
+sub printFancyLine
+{
+        my ($values, $lengths) = @_;
+
+        print "| ",
+                join(" | ", map { $values->[$_] . (" " x ($lengths->[$_] - length($values->[$_]))) } (0 .. $#$lengths)),
+                " |\n";
+}
+
+sub printPlainLine
+{
+        print join("\t", @_), "\n";
+}
+
+sub myComplete
+{
+        my ($text, $line, $start, $end) = @_;
+        return $term->completion_matches(lc($text), $attribs->{'list_completion_function'});
+}
+
+# A method to do a temporary file.
+# Normally we SHOULD use File::Temp but it's not in current perl.
+# Perhaps in 5.7
+sub make_temp_file
+{
+        my $name;
+        do {
+                my $seqno = unpack("%16C*", join('', localtime, values %ENV));
+                $name = "$tmp_dir/.myoracle-$seqno";
+        } until sysopen(FH, $name, O_RDWR|O_CREAT|O_EXCL, 0666);
+        my $fh = *FH{IO};
+        $fh->autoflush(1);
+
+        return ($fh, $name);
+}
+
+# we do some verifications before unlinking the temp file
+# Normally we SHOULD use File::Temp but it's not in current perl.
+# Perhaps in 5.7
+sub unlink_temp_file
+{
+        my ($fh, $fname) = (shift, shift);
+
+        # close the filehandle
+        close $fh || die "$!";
+
+        # stat the filehandle
+        my @fh = stat $fname;
+
+        # we don't delete the file if we found too many hard links
+        print STDERR ("unlink_temp_file: fstat found too many links.\n"), return if ($fh[3] > 1);
+
+        # this is no longer a file, but may be a directory, or worse
+        print STDERR ("panic: $fname is no longer a file.\n"), return unless (-f $fname);
+        unlink $fname;
+}
+
+# Zap the crap from a SQL statement before sending it to Oracle.
+# Remove leading and trailing whitespace, as well as the semicolon.
+# Convert tabs and newlines to spaces.
+sub strip
+{
+        $_ = shift;
+        s/\s*\t+\s*/ /mg;
+        s/\s*\n+\s*/ /g;
+        s/^\s*//;
+        s/\s*$//;
+        s/\s*;$//;
+        s|\s*/$||;
+        return $_;
+}
+
+# Add the user's tables and synonyms to the completion word list
+sub tables_completion
+{
+        my $sql = "select table_name from user_Tables order by table_name";
+        eval { $user_tables = $dbh->selectall_arrayref($sql) };
+        if ($@) { print $DBI::errstr . "\n"; return; }
+
+        my $sql = "select table_name from user_synonyms order by table_name";
+        eval { $user_synonyms = $dbh->selectall_arrayref($sql) };
+        if ($@) { print $DBI::errstr . "\n"; return; }
+
+        my @tables = ();
+        for (@$user_synonyms) { push @tables, lc $_->[0]; }
+        for (@$user_tables) { push @tables, lc $_->[0]; }
+        $attribs->{completion_word} = [@{ $attribs->{completion_word}}, @tables ];
+}
+
+# To parse files
+sub parseFile
+{
+        my($filename) = @_;
+        my($ret) = '';
+
+        if (!(open(CMD, "$filename")))
+        {
+                print STDERR "Unable to open command file '$filename' for processing.\n";
+                return;
+        }
+        else
+        {
+                local($/) = undef;
+                $ret = <CMD>;
+        }
+        close(CMD);
+
+        chomp($ret);
+        $ret = strip($ret);
+
+        return($ret);
+}
+
+# make SQL all purty
+sub sqlbeautify
+{
+        my $q = shift;
+
+        my $maxkwd = 0;
+
+        my @keywords = qw(SELECT UPDATE INSERT DELETE GRANT
+                FROM WHERE VALUES HAVING
+                AND OR UNION
+                GROUP\s+BY ORDER\s+BY
+                );
+
+        $q =~ s/\n//g;
+
+        for my $key (@keywords)
+        {
+                if ($q =~ s/($key)/\n$key/gi)
+                {
+                        $maxkwd = length($key) if (length($key) > $maxkwd);
+                }
+        }
+
+        for my $key (@keywords)
+        {
+                my $kywrd = sprintf "%${maxkwd}s", $key;
+                $kywrd =~ s/\\s+/ /;
+                $q =~ s/($key)/$kywrd/g;
+        }
+        return $q;
+}
